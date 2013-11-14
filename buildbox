@@ -1,0 +1,652 @@
+#!/bin/bash -eu
+# ------------------------------------------------------------------------------
+
+function usage
+{
+    name=`basename $0`
+
+    echo "usage:"
+    echo "  $name -P PROFILE OPTIONS"
+    echo "    -P PROFILE - use buildbox defined by PROFILE, requires -s if"
+    echo "              profile is defined for the first time"
+    echo ""
+    echo "  $name -r"
+    echo "    -r     - lists all available variants of buildbox"
+    echo ""
+    echo "OPTIONS are:"
+    echo "    -s VARIANT - variant of buildbox to setup"
+    echo "    -D         - remove buildbox in DIR"
+    echo "    -n SRC_VARIANT"
+    echo "               - create new variant of buildbox from SRC_VARIANT"
+    echo "    -m BUILDBOX_DIR1=HOST_DIR1 BUILDBOX_DIR2=HOST_DIR2 ..."
+    echo "               - map HOST_DIR into BUILDBOX_DIR"
+    echo "    -l         - show versions of buildboxes"
+    echo "    -V VER     - use specified version of buildbox, excludes -U"
+    echo "    -U         - update existing buildbox to newest version available,"
+    echo "                 excludes -V VER"
+    echo "    -v         - verbose"
+    echo "    -c CMD     - instead of running shell, execute CMD in buildbox"
+    echo "                 (must be specified at the end, as it takes all remaining args)"
+    echo
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+PROFILE=""
+VARIANT=""
+MODE=""
+DIRMAP=""
+NEWSRC=""
+VER=""
+if [ "`which lockfile`" == "" ]
+then
+   echo -e "lockfile command not available. Please install it with command :\nsudo apt-get install procmail"
+   exit 1
+fi
+
+
+if [ -f $HOME/.buildbox_dir ]; then
+    BUILDBOX_DIR="`cat $HOME/.buildbox_dir`/"
+else
+    BUILDBOX_DIR="$HOME/.buildbox/"
+fi
+
+CMD=""
+VARIANT_CLONED="false"
+
+BUILDBOX_REPO=
+
+RETCODE=0
+
+set +e
+opts=`getopt Dn:p:P:s:m:vc:lrV:U "$@"`
+if [ $? -ne 0 ]; then
+    usage
+fi
+set -e
+
+set -- $opts
+while [ $# -gt 0 ]; do
+    case "$1" in
+        (-r) MODE="list"; break;;
+        (-D) MODE="delete";;
+        (-P) PROFILE=${2}; shift;;
+        (-s) VARIANT=${2}; shift;;
+        (-n) MODE="new"; NEWSRC=${2}; shift;;
+        (-m) DIRMAP="$DIRMAP $2"; shift;;
+        (-c) shift; CMD="${@:1:($#-1)}"; break;; # CMD now has all args up (except last --)
+        (-l) MODE="log";;
+        (-U) MODE="update";;
+        (-v) set -x;;
+        (-V) VER=$2; shift;;
+        (--) shift; break;;
+        (-*) usage;;
+        (*)  break;;
+    esac
+    shift
+done
+
+# just list remote branches and exit
+if [ "$MODE" == "list" ]; then
+    git ls-remote -h $BUILDBOX_REPO 2>/dev/null | awk '{print $2}' \
+        | sed 's/refs\/heads\///' | sort
+    exit 0
+fi
+
+# PROFILE is always needed
+if [ -z "$PROFILE" ]; then
+    usage
+fi
+
+# if we're deleting then variant is not needed
+if [ "$MODE" == "delete" ]; then
+    if [ -n "$VARIANT" ]; then
+        usage
+    fi
+fi
+
+# if in update mode then disallow -V VER
+# it makes little sense in fact: to update to most recent version and go back
+# to specific one
+if [ "$MODE" == "update" ]; then
+    if [ -n "$VER" ]; then
+        usage
+    fi
+fi
+
+DIR=""
+# setup internal variables according to PROFILE
+profile_dir="${BUILDBOX_DIR}$PROFILE"
+
+if [ "$MODE" != "delete" ]; then
+    mkdir -p "$profile_dir"
+
+    # store dir mapping if defined, read if not defined
+    if [ -n "$DIRMAP" ]; then
+        echo "$DIRMAP" > $profile_dir/mapping
+    else
+        if [ -f $profile_dir/mapping ]; then
+            DIRMAP=`cat $profile_dir/mapping`
+        fi
+    fi
+
+    # setup ccache
+    ccache_dir="$profile_dir/ccache"
+    mkdir -p $ccache_dir
+    DIRMAP="$DIRMAP BUILDBOX_HOME/.ccache=$ccache_dir"
+fi
+
+# setup dir for storing rootfs (depends on version)
+content_postfix="HEAD"
+if [ -n "$VER" ]; then
+    content_postfix="$VER"
+fi
+DIR="$profile_dir/content-$content_postfix"
+
+# setup VARIANT
+if [ -n "$VARIANT" ]; then
+    if [ -f $profile_dir/variant ]; then
+        if [ "$VARIANT" != "`cat $profile_dir/variant`" ]; then
+            echo "Strange, profile $PROFILE is setup for variant `cat $profile_dir/variant`, but you requested '$VARIANT'"
+        fi
+    else
+        echo "$VARIANT" > $profile_dir/variant
+    fi
+else
+    if [ -f $profile_dir/variant ]; then
+        VARIANT="`cat $profile_dir/variant`"
+    fi
+fi
+
+# if there is no DIR, VARIANT is needed (setup mode)
+if [ ! -d $DIR ]; then
+    if [ -z "$VARIANT" ]; then
+        usage
+    fi
+fi
+
+if [ "$MODE" == "new" ]; then
+    if [ -n "$VER" ]; then
+        usage
+    fi
+fi
+
+ROOTFS_DIR=$DIR/rootfs
+
+UNIQUE_ID=`md5sum <(echo "$ROOTFS_DIR") | awk '{print $1}'`
+
+MOUNTS_FILE=/tmp/${UNIQUE_ID}_buildbox_mounts
+
+# ------------------------------------------------------------------------------
+# lock-related variables and helper functions
+MOUNTS_FILE_LOCK=/tmp/${UNIQUE_ID}_buildbox_mounts.lock
+INIT_LOCK=/tmp/${UNIQUE_ID}_buildbox_init.lock
+
+function get_lock
+{
+    lock_file=$1
+
+    while lockfile -! -1 -r 1 $lock_file 2>/dev/null; do
+        # failed to get lock, so
+
+        # 1. check for dangling lock (older than 5 minutes and with pid that
+        #    no longer exists)
+        remove_lock=0
+        set +e
+        lock_file_timestamp=`stat -c %Y $lock_file 2>/dev/null`
+        if [[ ${lock_file_timestamp-0} -ne 0 ]]; then
+            if [[ ${lock_file_timestamp} -lt `date +"%s" --date "-5 minutes"` ]]; then
+                pid=`perl -we 'print <>' $lock_file 2>/dev/null`
+                if [ "${pid--1}" -gt 0 ]; then # if valid pid then check if exists
+                    if ! ps -p $pid -o comm= &>/dev/null; then
+                        remove_lock=1
+                    fi
+                else # force remove if there is no pid
+                    remove_lock=1
+                fi
+            fi
+        fi
+        set -e
+
+        if [[ $remove_lock == 1 ]]; then
+            echo "WARNING: Overtaking dangling lock: $lock_file"
+            rm -f $lock_file
+        fi
+
+        # 2. sleep for a while and try again
+        sleep 2
+    done
+
+    chmod u+w $lock_file
+    echo "$$" > $lock_file
+}
+
+function get_mount_lock
+{
+    get_lock $MOUNTS_FILE_LOCK
+}
+
+function release_mount_lock
+{
+    rm -f $MOUNTS_FILE_LOCK
+}
+
+function get_init_lock
+{
+    get_lock $INIT_LOCK
+}
+
+function release_init_lock
+{
+    rm -f $INIT_LOCK
+}
+
+# ------------------------------------------------------------------------------
+# this function checks if directory given as $1 is mounted and if not
+# it fails with fatal error
+function paranoid_mount_check
+{
+    if ! mount | egrep -q "\bon $1\b"; then
+        echo "ERROR: $1 is not mounted! (and should be according to $MOUNTS_FILE)"
+        echo "Cannot recover, aborting..."
+        release_mount_lock
+        # remove safe_delete from default trap
+        trap "do_umount_all $$; release_init_lock" EXIT
+        false
+    fi
+}
+
+# ------------------------------------------------------------------------------
+function do_mount
+{
+    get_mount_lock
+
+    for mount_point in $@; do
+        if [ ! -f $MOUNTS_FILE ]; then
+            touch $MOUNTS_FILE
+        fi
+
+        if ! egrep -q "/$mount_point\b" $MOUNTS_FILE; then
+            # not mounted yet
+            mkdir -p $ROOTFS_DIR/$mount_point
+            if [ "$mount_point" == "dev" ]; then
+                sudo mount --rbind /$mount_point $ROOTFS_DIR/$mount_point
+            else
+                sudo mount --bind /$mount_point $ROOTFS_DIR/$mount_point
+            fi
+            echo "$ROOTFS_DIR/$mount_point $$" >> $MOUNTS_FILE
+        else
+            if ! egrep -q "$mount_point.*\b$$\b" $MOUNTS_FILE; then
+                # already mounted but current pid not registered
+                sed -i -re "s#($mount_point.*)#\1 $$#" $MOUNTS_FILE
+            fi
+
+            paranoid_mount_check $ROOTFS_DIR/$mount_point
+        fi
+    done
+
+    release_mount_lock
+}
+
+function clone_repo
+{
+    if [ ! -d $DIR ]; then
+        mkdir -p $DIR
+        pushd $DIR >/dev/null
+            git init
+            if git fetch $BUILDBOX_REPO $VARIANT:refs/remotes/origin/$VARIANT; then
+                git checkout $VARIANT
+                git remote add origin $BUILDBOX_REPO
+            else
+                if [ "$MODE" == "new" ]; then
+                    git fetch $BUILDBOX_REPO $NEWSRC:refs/remotes/origin/$NEWSRC
+
+                    git checkout $NEWSRC
+                    git remote add origin $BUILDBOX_REPO
+
+                    git checkout -B $VARIANT
+                    git push origin $VARIANT
+
+                    git branch -d $NEWSRC
+                else
+                    echo "No such variant: $VARIANT. Use -n to create new"
+                    popd >/dev/null
+                    rm -rf $DIR
+                    exit 1
+                fi
+            fi
+
+            git config branch.$VARIANT.remote origin
+            git config branch.$VARIANT.merge refs/heads/$VARIANT
+        popd >/dev/null
+
+        # keep variant name
+        echo "$VARIANT" > $ROOTFS_DIR/.buildbox_variant
+
+        VARIANT_CLONED="true"
+    else
+        # do some basic sanity checks on existing dir
+        if [ ! -d $DIR/rootfs -o ! -d $DIR/.git -o ! -f $DIR/rootfs/etc/passwd ]; then
+            echo "$DIR does not seem to be correct buildbox directory"
+            exit 1
+        fi
+    fi
+}
+
+function add_user
+{
+    user_name="`id -un`_$VARIANT"
+    user_name=${user_name:0:32}
+
+    if ! sudo chroot $ROOTFS_DIR id -u $user_name &>/dev/null; then
+        user_uid=`id -u`
+        user_gid=`id -g`
+
+        if ! grep -q $user_gid $ROOTFS_DIR/etc/group; then
+            sudo chroot $ROOTFS_DIR addgroup --force-badname --gid $user_gid $user_name 2>/dev/null
+        fi
+
+        if ! grep -q $user_uid $ROOTFS_DIR/etc/passwd; then
+            sudo chroot $ROOTFS_DIR adduser --force-badname --shell /bin/bash --uid $user_uid \
+                                    --gid $user_gid $user_name -q &>/dev/null <<EOF
+$user_name
+$user_name
+
+
+
+
+
+Y
+EOF
+        else
+            user_name=`grep $user_uid $ROOTFS_DIR/etc/passwd | cut -f1 -d:`
+        fi
+    fi
+}
+
+function do_mount_dirmap
+{
+    for i in $DIRMAP; do
+        i=`echo $i | sed s#BUILDBOX_HOME#/home/$user_name#`
+
+        buildbox_dir="$ROOTFS_DIR/`echo $i | cut -f1 -d=`"
+        host_dir=`echo $i | cut -f2 -d=`
+        host_dir=`eval readlink -f $host_dir`
+
+        if [ ! -d $host_dir ]; then
+            echo "WARNING: Can not map non existing host dir [$host_dir]"
+            continue
+        fi
+
+        mkdir -p $buildbox_dir
+        sudo chown `id -u`:`id -g` `dirname $buildbox_dir`
+
+        buildbox_dir=`readlink -f $buildbox_dir`
+        host_dir=`readlink -f $host_dir`
+
+        get_mount_lock
+
+        if ! egrep -q "^$buildbox_dir\b" $MOUNTS_FILE; then
+            # not mounted yet
+            sudo mount --bind $host_dir $buildbox_dir
+            echo "$buildbox_dir $$" >> $MOUNTS_FILE
+        else
+            if ! egrep -q "$buildbox_dir.*\b$$\b" $MOUNTS_FILE; then
+                # already mounted but current pid not registered
+                sed -i -re "s#($buildbox_dir.*)#\1 $$#" $MOUNTS_FILE
+            fi
+
+            paranoid_mount_check $buildbox_dir
+        fi
+
+        release_mount_lock
+    done
+}
+
+function populate_env
+{
+    mkdir -p $ROOTFS_DIR/etc/profile.d
+    # make script that will set env variables in buildbox
+    # (/etc/profile.d/*.sh scripts gets run automatically by /etc/profile)
+    export | perl -wne 'not /LC_|OLDPWD|TERMCAP/ and /declare -x ([^=]+)=(.*)/ and
+        print "if [ -z \"\$$1\" ]; then export $1=$2; fi\n"' \
+        > $ROOTFS_DIR/etc/profile.d/setup_env.sh
+
+    user_dot_profile="$ROOTFS_DIR/home/$user_name/.profile"
+
+    # force buildbox's PS1
+    if grep -q PS1 $user_dot_profile; then
+        sed -i -re '/export PS1.*/d' $user_dot_profile
+        echo 'export PS1="\[\e[0;32m\][\u@buildbox \W]# \[\e[m\]"' >> $user_dot_profile
+    fi
+
+    # copy time-related settings from host
+    for i in timezone localtime; do
+        if [ -f /etc/$i ]; then
+            cp -L /etc/$i $ROOTFS_DIR/etc/$i
+        fi
+    done
+
+    # misc...
+    cp /etc/resolv.conf $ROOTFS_DIR/etc/resolv.conf
+    cp /etc/hosts $ROOTFS_DIR/etc/hosts
+}
+
+# ------------------------------------------------------------------------------
+function do_umount_all_nolock
+{
+    set +e # can not fail here since we will be called again from trap
+
+    pid=$1
+
+    if [ -f $MOUNTS_FILE ]; then
+        for mount_point in `cut -f1 -d' ' $MOUNTS_FILE`; do
+            # remove current pid from list
+            sed -i -re "s#($mount_point.*) $pid(\b.*)#\1\2#" $MOUNTS_FILE
+
+            # if no pid left - umount
+            if grep -q "^$mount_point\$" $MOUNTS_FILE; then
+                if mount | grep -q $mount_point; then
+                    sudo umount -l $mount_point
+                fi
+            fi
+
+            sed -i -r -e "s|^$mount_point\$||" -e '/^$/d' $MOUNTS_FILE
+        done
+
+        # remove list completly if empty
+        if [ ! -s $MOUNTS_FILE ]; then
+            rm -f $MOUNTS_FILE
+        fi
+    fi
+    set -e
+}
+
+function do_umount_all
+{
+    get_mount_lock
+
+    do_umount_all_nolock $1
+
+    release_mount_lock
+}
+trap "do_umount_all $$;" EXIT
+
+function cleanup_dangling_mounts
+{
+    get_mount_lock
+
+    if [ -f $MOUNTS_FILE ]; then
+        for pid in `perl -wnae 'shift @F; foreach my $p (@F) {print "$p\n"}' $MOUNTS_FILE | sort | uniq`; do
+            if [ "${pid--1}" -gt 0 ]; then
+                if ! ps -p $pid -o comm= &>/dev/null; then
+                    echo "WARNING: Dangling mounts for PID=$pid. Removing."
+                    do_umount_all_nolock $pid
+                fi
+            fi
+        done
+    fi
+
+    release_mount_lock
+}
+
+function safe_delete
+{
+    if [ ! -d "$DIR" ]; then
+        echo "Nothing to remove at $DIR"
+    else
+        if ! ls $MOUNTS_FILE &>/dev/null; then
+            set +e
+                if mount | grep `readlink -f $ROOTFS_DIR`; then
+                    echo "WARNING! No buildbox session detected, but still can not delete."
+                    echo "Dangling mounts found (listed below). Umount manually and try again."
+                    mount | grep `readlink -f $ROOTFS_DIR`
+                else
+                    if [ -d $ROOTFS_DIR ]; then
+                        # safe to delete
+                        pushd $ROOTFS_DIR >/dev/null
+                            sudo chown -R `id -un` `ls -1 . | grep -v 'dev\|sys\|tmp\|proc'`
+                        popd >/dev/null
+                    fi
+                    rm -rf $DIR
+                fi
+            set -e
+        else
+            echo "Other buildbox session detected. Can not delete."
+        fi
+    fi
+}
+
+function do_sudo_setup
+{
+    sudo chmod 0666 $ROOTFS_DIR/etc/sudoers
+
+    sudoers_line="$user_name ALL=(ALL) NOPASSWD: ALL"
+    if ! grep -q "$sudoers_line" $ROOTFS_DIR/etc/sudoers; then
+        echo $sudoers_line >> $ROOTFS_DIR/etc/sudoers
+    fi
+
+    sudo chown root:root $ROOTFS_DIR/usr/bin/sudo
+    sudo chmod u+s $ROOTFS_DIR/usr/bin/sudo
+    sudo chown root:root $ROOTFS_DIR/usr/lib/sudo/sudoers.so
+    sudo chmod g-w $ROOTFS_DIR/usr/lib/sudo/sudoers.so
+    sudo chmod 0440 $ROOTFS_DIR/etc/sudoers
+    sudo chown root:root  $ROOTFS_DIR/etc/sudoers
+    sudo chmod 0440 $ROOTFS_DIR/etc/sudoers.d/README
+    sudo chown root:root  $ROOTFS_DIR/etc/sudoers.d/README
+
+}
+
+function install_whereami
+{
+    echo -e "echo 'DIR:`readlink -f $ROOTFS_DIR`\nVARIANT:$VARIANT'" > $ROOTFS_DIR/usr/bin/whereami
+    chmod +x $ROOTFS_DIR/usr/bin/whereami
+
+    if ! grep -q whereami $DIR/.git/info/exclude; then
+        echo "whereami" >> $DIR/.git/info/exclude
+    fi
+}
+
+# VARIANT will usually not be supplied as a arg, so we have to find it somehow...
+#
+# When VARIANT is defined as an arg it is written to $ROOTFS_DIR/.buildbox_variant
+# file then
+# So, try to get VARIANT from this file, if it does not exist (backward
+# compatibility) fall back to git. The problem is that with git
+# we may get '(no branch)' token for rewinded workspaces.
+# If we get good name from git (not '(no branch)') then put result to
+# file $ROOTFS_DIR/.buildbox_variant
+# If we have no .buildbox_variant file and git returns '(no branch)' then
+# we will fail in a moment :-)
+#
+# This functions assumes that is called from $VARIANT dir
+function determine_VARIANT
+{
+    if [ -f $ROOTFS_DIR/.buildbox_variant ]; then
+        VARIANT=`cat $ROOTFS_DIR/.buildbox_variant`
+    else
+        VARIANT="`git branch | head -n 1 | cut -d'*' -f2 | sed -e 's/^ //'`"
+    fi
+
+    if [ "$VARIANT" != "(no branch)" ]; then
+        echo "$VARIANT" > $ROOTFS_DIR/.buildbox_variant
+    fi
+}
+
+# ------------------------------------------------------------------------------
+if [ "$MODE" == "delete" ]; then
+    safe_delete
+elif [ "$MODE" == "log" ]; then
+    pushd $DIR >/dev/null
+        git log --decorate --pretty=oneline --abbrev-commit --all --color=auto
+    popd >/dev/null
+else
+    # --- start of initialization
+    get_init_lock
+    trap "do_umount_all $$; safe_delete; release_init_lock" EXIT
+
+    clone_repo
+
+    pushd $DIR >/dev/null
+        determine_VARIANT
+
+        if [ "$MODE" == "update" ]; then
+            if ! ls $MOUNTS_FILE &>/dev/null; then
+                git reset --hard
+                git pull $BUILDBOX_REPO $VARIANT:refs/remotes/origin/$VARIANT
+            else
+                echo "Other buildbox session detected. Can not update."
+            fi
+        fi
+
+        # move to specific version if required
+        set +e
+        if [ -n "$VER" ]; then
+            if [ "`git rev-parse --short HEAD`" != "$VER" ]; then
+                git checkout -f $VER
+            fi
+        fi
+        set -e
+    popd >/dev/null
+
+    cleanup_dangling_mounts
+
+    do_mount dev proc sys tmp
+    add_user
+
+    do_sudo_setup
+
+    do_mount_dirmap
+
+    populate_env
+
+    if [ "$VARIANT_CLONED" == "true" ]; then
+        pushd $DIR >/dev/null
+            for i in `git status -s | grep -v '??' | awk '{print $2}'`; do
+                git update-index --assume-unchanged $i
+            done
+        popd >/dev/null
+    fi
+
+    install_whereami
+
+    pushd $DIR >/dev/null
+        echo "*** Using $VARIANT in version `git rev-parse --short HEAD` ***"
+    popd >/dev/null
+
+    trap "do_umount_all $$" EXIT
+    release_init_lock
+    # --- end of initialization
+
+    set +e
+    if [ -z "$CMD" ]; then
+        sudo chroot $ROOTFS_DIR login -f $user_name
+    else
+        sudo chroot $ROOTFS_DIR su -c "source /etc/profile; source ~/.profile; $CMD" $user_name
+        RETCODE=$?
+    fi
+    set -e
+fi
+
+exit $RETCODE
+
