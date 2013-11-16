@@ -97,8 +97,8 @@ SETUP GIT REPOSITORY
       To setup initial git repository use prepare_repo.sh script.
       Destination directory must be specified as parameter.
 
-      Url to resulting bare git repository must be then configured within buildbox script
-      (BUILDBOX_REPO variable)
+      Url to resulting bare git repository must be put to buildbox configuration file -
+      $HOME/.buildbox_repo
 
 SETUP BUILDBOX
       In order to run buildbox tool it is required to use modern Ubuntu distribution with git

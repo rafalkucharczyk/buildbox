@@ -38,12 +38,18 @@ MODE=""
 DIRMAP=""
 NEWSRC=""
 VER=""
-if [ "`which lockfile`" == "" ]
-then
-   echo -e "lockfile command not available. Please install it with command :\nsudo apt-get install procmail"
+
+if ! which lockfile git >/dev/null; then
+   echo -e "lockfile or git command not available"
    exit 1
 fi
 
+if [ ! -f $HOME/.buildbox_repo ]; then
+   echo -e "Configuration file not found: $HOME/.buildbox_repo"
+   exit 1
+fi
+
+BUILDBOX_REPO="`cat $HOME/.buildbox_repo`/"
 
 if [ -f $HOME/.buildbox_dir ]; then
     BUILDBOX_DIR="`cat $HOME/.buildbox_dir`/"
@@ -53,8 +59,6 @@ fi
 
 CMD=""
 VARIANT_CLONED="false"
-
-BUILDBOX_REPO=
 
 RETCODE=0
 
