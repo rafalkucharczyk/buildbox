@@ -299,14 +299,14 @@ function clone_repo
         pushd $DIR >/dev/null
             git init
             if git fetch $BUILDBOX_REPO $VARIANT:refs/remotes/origin/$VARIANT; then
-                git checkout $VARIANT
                 git remote add origin $BUILDBOX_REPO
+                git checkout $VARIANT
             else
                 if [ "$MODE" == "new" ]; then
                     git fetch $BUILDBOX_REPO $NEWSRC:refs/remotes/origin/$NEWSRC
 
-                    git checkout $NEWSRC
                     git remote add origin $BUILDBOX_REPO
+                    git checkout $NEWSRC
 
                     git checkout -B $VARIANT
                     git push origin $VARIANT
